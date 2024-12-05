@@ -18,7 +18,9 @@ If the run is interrupted just run _BactStream_ again and it'll continue where i
 If any of your dependencies are not in the path they can be provided:
 
 ```shell
-BactStream <reference.fasta>
+usage: BactStream [-h] --reference REFERENCE [--snpeff SNPEFF] [--gatk GATK]
+                  [--samtools SAMTOOLS] --sra_ids SRA_IDS
+                  [--trimgalore TRIMGALORE] [--cutadapt CUTADAPT]
 ```
 
 
