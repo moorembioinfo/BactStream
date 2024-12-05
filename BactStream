@@ -1,0 +1,176 @@
+#!/usr/bin/python3
+import sys
+import os
+import subprocess
+import shutil
+from pathlib import Path
+import argparse
+
+def add_args(a):
+	parser = argparse.ArgumentParser(description="BactVar")
+	parser.add_argument(
+		"--reference",
+		"-r",
+		help="Reference genome for comparison",
+		required=True,
+	)
+	parser.add_argument(
+		"--snpeff",
+		"-s",
+		default=False,
+		help="Path to snpeff",
+		required=False,
+	)
+	parser.add_argument(
+		"--gatk",
+		"-g",
+		default=False,
+		help="Path to gatk",
+		required=False,
+	)
+	parser.add_argument(
+		"--samtools",
+		"-t",
+		default=False,
+		help="Path to samtools",
+		required=False,
+	)
+	parser.add_argument(
+		"--sra_ids",
+		"-i",
+		help="File containing a list of SRA IDs (one per line)",
+		required=True,
+	)
+	parser.add_argument(
+		"--trimgalore",
+		"-T",
+		default=False,
+		help="Path to TrimGalore (if not in the PATH)",
+		required=False,
+	)
+	parser.add_argument(
+		"--cutadapt",
+		"-C",
+		default=False,
+		help="Path to Cutadapt (if not in the PATH)",
+		required=False,
+	)
+	args = parser.parse_args(a)
+	return args
+
+def run_command(command):
+	subprocess.run(command, shell=True, check=True)
+
+def find_executable(tool_name, custom_path):
+	if custom_path:
+		if not custom_path.endswith('/'):
+			custom_path += '/'
+		print(f'{tool_name} path provided as: {custom_path}')
+		return custom_path
+	else:
+		tool_path = shutil.which(tool_name)
+		if tool_path:
+			print(f'{tool_name} found in the PATH: {tool_path}')
+			return tool_path
+		else:
+			print(f'{tool_name} path not provided and not in the PATH')
+			exit()
+
+def get_completed_ids(sra_ids):
+	"""Get the list of SRA IDs that already have a .snpeff.vcf file."""
+	completed_ids = []
+	for sra_id in sra_ids:
+		if Path(f"{sra_id}.filtered.snpeff.vcf").exists():
+			completed_ids.append(sra_id)
+	return completed_ids
+
+def build_snpEff(reference_file, snpeffpath):
+	print("Building custom snpEff database...")
+	try:
+		run_command(f"prokka {reference_file} --cpus 6 --prefix customref")
+		snpeff_data_dir = f"{snpeffpath}data/custom-db/"
+		os.makedirs(snpeff_data_dir, exist_ok=True)
+		shutil.copy("customref/customref.gbk", f"{snpeff_data_dir}genes.gbk")
+		config_path = f"{snpeffpath}snpEff.config"
+		with open(config_path, "a") as config_file:
+			config_file.write("\ncustom-db.genome: custom-db\n")
+		run_command(f"java -jar {snpeffpath}snpEff.jar build -genbank -c {config_path} -v custom-db")
+	except Exception as e:
+		print(f"Error running Prokka or building snpEff database: {e}")
+
+if __name__ == "__main__":
+	args = add_args(sys.argv[1:])
+	reference_file = args.reference
+	snpeffpath = args.snpeff
+	gatkPATH = args.gatk
+	samtoolsPATH = args.samtools
+	sra_ids_file = args.sra_ids
+	trimgalore_path = args.trimgalore
+	cutadapt_path = args.cutadapt
+
+	snpeffpath = find_executable("snpEff.jar", snpeffpath)
+	gatkPATH = find_executable("gatk", gatkPATH)
+	samtoolsPATH = find_executable("samtools", samtoolsPATH)
+	trimgalore_path = find_executable("trim_galore", trimgalore_path)
+	cutadapt_path = find_executable("cutadapt", cutadapt_path)
+	build_snpEff(reference_file, snpeffpath)
+
+	run_command(f"bwa index {reference_file}")
+	run_command(f"{samtoolsPATH}/samtools faidx {reference_file}")
+	reference_dict = reference_file.replace(reference_file.split('.')[-1], 'dict')
+	run_command(f"{gatkPATH}gatk CreateSequenceDictionary -REFERENCE {reference_file} -OUTPUT {reference_dict}")
+
+	with open(sra_ids_file, "r") as sra_file:
+		sra_ids = [line.strip() for line in sra_file if line.strip()]
+
+	completed_ids = get_completed_ids(sra_ids)
+	remaining_ids = [sra_id for sra_id in sra_ids if sra_id not in completed_ids]
+
+	if not remaining_ids:
+		print("All genomes have been processed.")
+		sys.exit()
+
+	print(f"Resuming from SRA ID: {remaining_ids[0]}")
+	for sra_id in remaining_ids:
+		try:
+			print(f"Processing {sra_id}...")
+			
+			# Download FASTQ files
+			run_command(f"../STEC/sratoolkit.3.0.0-ubuntu64/bin/fasterq-dump --split-files {sra_id}")
+			r1_file = f"{sra_id}_1.fastq"
+			r2_file = f"{sra_id}_2.fastq"
+
+			# Trim and quality filter reads
+			print(f"Trimming reads for {sra_id}...")
+			run_command(f"{trimgalore_path}trim_galore --path_to_cutadapt {cutadapt_path}cutadapt --paired --gzip {r1_file} {r2_file}")
+			trimmed_r1_file = f"{sra_id}_1_val_1.fq.gz"
+			trimmed_r2_file = f"{sra_id}_2_val_2.fq.gz"
+
+			# GATK
+			run_command(f'bwa mem -R "@RG\\tID:{sra_id}\\tPL:ILLUMINA\\tLB:lib1\\tSM:{sra_id}" {reference_file} {trimmed_r1_file} {trimmed_r2_file} > aln.sam')
+			run_command(f'{gatkPATH}gatk --java-options "-Xmx4G" SortSam -I aln.sam -O sorted.bam -SORT_ORDER coordinate')
+			run_command(f'{gatkPATH}gatk --java-options "-Xmx4G" MarkDuplicates -I sorted.bam -O dedup.bam -METRICS_FILE metrics.txt')
+			run_command(f'{gatkPATH}gatk --java-options "-Xmx4G" BuildBamIndex -INPUT dedup.bam')
+			run_command(f'{gatkPATH}gatk --java-options "-Xmx4G" HaplotypeCaller -R {reference_file} -I dedup.bam -ploidy 1 -O raw_gVCF.vcf -ERC GVCF')
+			run_command(f'{gatkPATH}gatk --java-options "-Xmx4G" GenotypeGVCFs -R {reference_file} --variant raw_gVCF.vcf -O raw.vcf')
+			filtered_vcf = f"{sra_id}.filtered.vcf"
+			run_command(f'{gatkPATH}gatk --java-options "-Xmx4G" VariantFiltration -R {reference_file} -V raw.vcf -O {filtered_vcf} --filter-expression "QUAL < 30.0" --filter-name "LowQual"')
+
+			# Annotate the VCF with snpeff 
+			annotated_vcf = f"{filtered_vcf.replace('.vcf', '.snpeff.vcf')}"
+			run_command(f'java -jar -Xmx4G {snpeffpath}snpEff.jar -c {snpeffpath}snpEff.config custom-db {filtered_vcf} > {annotated_vcf}')
+
+			# Clean up 
+			for temp_file in [
+				"aln.sam", "sorted.bam", "metrics.txt", "dedup.bam", 
+				"raw_gVCF.vcf", "raw.vcf", r1_file, r2_file, 
+				trimmed_r1_file, trimmed_r2_file
+			]:
+				if os.path.exists(temp_file):
+					os.remove(temp_file)
+			print(f"Completed processing {sra_id}, output: {annotated_vcf}")
+		except Exception as e:
+			print(f"Error processing {sra_id}: {e}")
+			continue
+
+	print("\n\nAll tasks completed!\n\n")
