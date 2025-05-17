@@ -1,0 +1,17 @@
+name: bactstream
+channels:
+  - conda-forge
+  - bioconda
+  - defaults
+dependencies:
+  - python=3.9
+  - snpeff=5.1
+  - spades=3.15.5
+  - bakta=1.8.1
+  - bwa=0.7.17
+  - samtools=1.17
+  - cutadapt=4.4
+  - trim-galore=0.6.10
+  - sra-tools=3.0.0
+  - openjdk=11
+  - pip
