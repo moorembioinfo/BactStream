@@ -6,6 +6,7 @@ import shutil
 from pathlib import Path
 import argparse
 import psutil
+import re
 
 def get_resources(user_threads, user_memory):
     total_cores = os.cpu_count() or 2
@@ -36,6 +37,53 @@ def run_command(command):
     print(f"Running: {command}")
     subprocess.run(command, shell=True, check=True)
 
+def parse_java_major_version(version_output):
+    match = re.search(r'version "([^"]+)"', version_output)
+    if not match:
+        return None
+    version = match.group(1)
+    if version.startswith("1."):
+        parts = version.split(".")
+        return int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else None
+    major = version.split(".", 1)[0]
+    return int(major) if major.isdigit() else None
+
+def get_java_major_version(java_path):
+    try:
+        result = subprocess.run(
+            [str(java_path), "-version"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=True
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    return parse_java_major_version(result.stdout + result.stderr)
+
+def find_java_executable(min_major=17):
+    candidates = []
+    seen = set()
+
+    primary = shutil.which("java")
+    if primary:
+        candidates.append(primary)
+        seen.add(primary)
+
+    for extra in ["/usr/bin/java", "/bin/java", "/usr/local/bin/java"]:
+        if Path(extra).exists() and extra not in seen:
+            candidates.append(extra)
+            seen.add(extra)
+
+    for candidate in candidates:
+        major = get_java_major_version(candidate)
+        if major is not None and major >= min_major:
+            print(f"java using: {candidate} (version {major})")
+            return candidate
+
+    print(f"No Java runtime >= {min_major} found. Checked: {', '.join(candidates) if candidates else 'none'}")
+    sys.exit(1)
+
 def find_executable(tool_name, custom_path):
     if custom_path and custom_path != "False":
         if custom_path.endswith(tool_name) or tool_name in custom_path:
@@ -58,23 +106,38 @@ def find_executable(tool_name, custom_path):
 def get_completed_ids(sra_ids):
     return [sra_id for sra_id in sra_ids if Path(f"{sra_id}.bakta.gbk").exists()]
 
-def build_snpEff(reference_file, bakta_path, baktadb, snpeffpath, threads, memory):
+def find_first_existing_path(*paths):
+    for path in paths:
+        candidate = Path(path)
+        if candidate.exists():
+            return candidate
+    return None
+
+def build_snpEff(reference_file, bakta_path, baktadb, snpeffpath, java_path, threads, memory):
     gbk_out = Path("customref.gbk")
     if not gbk_out.exists():
-        print("Annotating reference genome with Bakta...")
-        run_command(f"{bakta_path} --db {baktadb} --output customref_bakta --prefix customref --threads {threads} {reference_file}")
-        shutil.copyfile("customref_bakta/customref.gbk", "customref.gbk")
+        bakta_gbk = find_first_existing_path("customref_bakta/customref.gbk", "customref_bakta/customref.gbff")
+        if bakta_gbk is None:
+            print("Annotating reference genome with Bakta...")
+            run_command(f"{bakta_path} --db {baktadb} --output customref_bakta --prefix customref --threads {threads} {reference_file}")
+            bakta_gbk = find_first_existing_path("customref_bakta/customref.gbk", "customref_bakta/customref.gbff")
+        if bakta_gbk is None:
+            raise FileNotFoundError("Bakta annotation finished but no GenBank output was found in customref_bakta/")
+        shutil.copyfile(bakta_gbk, gbk_out)
     else:
         print("Reference GBK already exists, skipping Bakta annotation.")
 
-    snpeff_db_dir = f"{snpeffpath}data/custom-db/"
-    if not Path(snpeff_db_dir).exists() or not Path(f"{snpeff_db_dir}genes.gbk").exists():
+    snpeff_jar = Path(snpeffpath)
+    snpeff_dir = snpeff_jar.parent if snpeff_jar.name == "snpEff.jar" else snpeff_jar
+    snpeff_db_dir = snpeff_dir / "data" / "custom-db"
+    genes_gbk = snpeff_db_dir / "genes.gbk"
+    if not snpeff_db_dir.exists() or not genes_gbk.exists():
         print("Building custom snpEff database using Bakta GBK...")
         os.makedirs(snpeff_db_dir, exist_ok=True)
-        shutil.copy("customref.gbk", f"{snpeff_db_dir}genes.gbk")
-        config_path = f"{snpeffpath}snpEff.config"
+        shutil.copy(gbk_out, genes_gbk)
+        config_path = snpeff_dir / "snpEff.config"
         config_line = "custom-db.genome: custom-db\n"
-        if Path(config_path).exists():
+        if config_path.exists():
             with open(config_path, "r") as cf:
                 if config_line not in cf.read():
                     with open(config_path, "a") as cfa:
@@ -82,7 +145,7 @@ def build_snpEff(reference_file, bakta_path, baktadb, snpeffpath, threads, memor
         else:
             with open(config_path, "w") as cfa:
                 cfa.write(config_line)
-        run_command(f"java -jar {snpeffpath}snpEff.jar build -genbank -c {config_path} -v custom-db")
+        run_command(f"{java_path} -jar {snpeff_jar} build -genbank -c {config_path} -v custom-db")
     else:
         print("snpEff DB already exists, skipping build.")
 
@@ -97,9 +160,11 @@ if __name__ == "__main__":
     cutadapt_path = find_executable("cutadapt", args.cutadapt)
     spades_path = find_executable("spades.py", args.spades)
     bakta_path = find_executable("bakta", args.bakta)
+    java_path = find_java_executable()
     baktadb = args.baktadb
 
-    build_snpEff(args.reference, bakta_path, baktadb, snpeffpath, threads, memory)
+    os.environ["PATH"] = f"{Path(java_path).parent}{os.pathsep}{os.environ['PATH']}"
+    build_snpEff(args.reference, bakta_path, baktadb, snpeffpath, java_path, threads, memory)
 
     run_command(f"bwa index {args.reference}")
     run_command(f"{samtoolsPATH} faidx {args.reference}")
@@ -135,11 +200,11 @@ if __name__ == "__main__":
             shutil.copyfile(assembled_fasta, named_fasta)
 
             run_command(f"{bakta_path} --db {baktadb} --output {sra_id}_bakta --prefix {sra_id} --threads {threads} {named_fasta}")
-            bakta_gbk = f"{sra_id}_bakta/{sra_id}.gbk"
-            bakta_gff = f"{sra_id}_bakta/{sra_id}.gff"
-            if Path(bakta_gbk).exists():
+            bakta_gbk = find_first_existing_path(f"{sra_id}_bakta/{sra_id}.gbk", f"{sra_id}_bakta/{sra_id}.gbff")
+            bakta_gff = find_first_existing_path(f"{sra_id}_bakta/{sra_id}.gff", f"{sra_id}_bakta/{sra_id}.gff3")
+            if bakta_gbk is not None:
                 shutil.move(bakta_gbk, f"{sra_id}.bakta.gbk")
-            if Path(bakta_gff).exists():
+            if bakta_gff is not None:
                 shutil.move(bakta_gff, f"{sra_id}.bakta.gff")
 
             run_command(f'bwa mem -t {threads} -R "@RG\\tID:{sra_id}\\tPL:ILLUMINA\\tLB:lib1\\tSM:{sra_id}" {args.reference} {trimmed_r1_file} {trimmed_r2_file} > {sra_id}_aln.sam')
@@ -152,7 +217,9 @@ if __name__ == "__main__":
             run_command(f'{gatkPATH} VariantFiltration -R {args.reference} -V {sra_id}_raw.vcf -O {filtered_vcf} --filter-expression "QUAL < 30.0" --filter-name "LowQual"')
 
             annotated_vcf = f"{filtered_vcf.replace('.vcf', '.snpeff.vcf')}"
-            run_command(f'java -jar -Xmx{memory}G {snpeffpath}snpEff.jar -c {snpeffpath}snpEff.config custom-db {filtered_vcf} > {annotated_vcf}')
+            snpeff_jar = Path(snpeffpath)
+            snpeff_dir = snpeff_jar.parent if snpeff_jar.name == "snpEff.jar" else snpeff_jar
+            run_command(f'{java_path} -Xmx{memory}G -jar {snpeff_jar} -c {snpeff_dir / "snpEff.config"} custom-db {filtered_vcf} > {annotated_vcf}')
 
             for temp_file in [
                 r1_file, r2_file, trimmed_r1_file, trimmed_r2_file,

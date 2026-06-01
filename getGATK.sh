@@ -37,4 +37,6 @@ export PATH="$INSTALL_DIR:$PATH"
 echo "Testing GATK..."
 gatk --help | head -n 5
 
-echo "✅ GATK setup complete. Restart your shell or run: source ~/.bashrc"
+echo "GATK is available in this shell now via PATH=$INSTALL_DIR:\$PATH"
+echo "For future shells, the PATH update has also been added to ~/.bashrc"
+echo "✅ GATK setup complete."
