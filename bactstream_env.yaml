@@ -15,5 +15,5 @@ dependencies:
   - cutadapt=4.4
   - trim-galore=0.6.10
   - sra-tools=3.0.0
-  - openjdk=11
+  - openjdk=17
   - pip

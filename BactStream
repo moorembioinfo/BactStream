@@ -103,6 +103,36 @@ def find_executable(tool_name, custom_path):
     print(f"{tool_name} path not provided and not in PATH")
     sys.exit(1)
 
+def find_snpeff_jar(custom_path):
+    if custom_path and custom_path != "False":
+        snpeff_path = Path(custom_path)
+        if snpeff_path.is_file() and snpeff_path.name == "snpEff.jar":
+            print(f"snpEff.jar using: {snpeff_path}")
+            return str(snpeff_path)
+        if snpeff_path.is_dir():
+            jar = snpeff_path / "snpEff.jar"
+            if jar.exists():
+                print(f"snpEff.jar found at {jar}")
+                return str(jar)
+        print(f"snpEff.jar path provided as: {custom_path}")
+        return custom_path
+
+    tool_path = shutil.which("snpEff.jar")
+    if tool_path:
+        print(f"snpEff.jar found in PATH: {tool_path}")
+        return tool_path
+
+    conda_prefix = os.environ.get("CONDA_PREFIX")
+    if conda_prefix:
+        share_dir = Path(conda_prefix) / "share"
+        candidates = sorted(share_dir.glob("snpeff*/snpEff.jar"))
+        if candidates:
+            print(f"snpEff.jar found in conda environment: {candidates[0]}")
+            return str(candidates[0])
+
+    print("snpEff.jar path not provided and not found in PATH or CONDA_PREFIX/share")
+    sys.exit(1)
+
 def get_completed_ids(sra_ids):
     return [sra_id for sra_id in sra_ids if Path(f"{sra_id}.bakta.gbk").exists()]
 
@@ -153,7 +183,7 @@ if __name__ == "__main__":
     args = add_args(sys.argv[1:])
     threads, memory = get_resources(args.threads, args.memory)
 
-    snpeffpath = find_executable("snpEff.jar", args.snpeff)
+    snpeffpath = find_snpeff_jar(args.snpeff)
     gatkPATH = find_executable("gatk", args.gatk)
     samtoolsPATH = find_executable("samtools", args.samtools)
     trimgalore_path = find_executable("trim_galore", args.trimgalore)
