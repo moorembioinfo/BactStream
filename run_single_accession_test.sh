@@ -44,6 +44,8 @@ echo "  memory:     ${MEMORY}G"
 
 ./BactStream \
   --reference "$REFERENCE" \
+  --reference_gbk refs/MG1655.gbk \
   --sra_ids "$ACCESSIONS" \
+  --skip_sample_bakta \
   --threads "$THREADS" \
   --memory "$MEMORY"

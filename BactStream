@@ -29,6 +29,8 @@ def add_args(a):
     parser.add_argument("--spades", default="spades.py", help="Path to SPAdes", required=False)
     parser.add_argument("--bakta", default="bakta", help="Path to bakta", required=False)
     parser.add_argument("--baktadb", default="", help="Path to Bakta DB. Defaults to $BACTSTREAM_BAKTA_DB if set.", required=False)
+    parser.add_argument("--reference_gbk", default="", help="Existing reference GenBank/GBFF annotation for snpEff DB build", required=False)
+    parser.add_argument("--skip_sample_bakta", action="store_true", help="Skip Bakta annotation of per-sample SPAdes assemblies", required=False)
     parser.add_argument("--threads", type=int, default=0, help="Threads per tool (auto if 0)")
     parser.add_argument("--memory", type=int, default=0, help="Memory (GB) per tool (auto if 0)")
     return parser.parse_args(a)
@@ -168,17 +170,44 @@ def find_first_existing_path(*paths):
             return candidate
     return None
 
-def build_snpEff(reference_file, bakta_path, baktadb, snpeffpath, java_path, threads, memory):
+def find_reference_gbk(reference_file, custom_path):
+    candidates = []
+    if custom_path:
+        candidates.append(custom_path)
+
+    reference_path = Path(reference_file)
+    stem_path = reference_path.with_suffix("")
+    candidates.extend([
+        reference_path.with_suffix(".gbk"),
+        reference_path.with_suffix(".gbff"),
+        stem_path.with_suffix(".gbk"),
+        stem_path.with_suffix(".gbff"),
+    ])
+
+    for candidate in candidates:
+        path = Path(candidate).expanduser()
+        if path.exists():
+            return path
+    return None
+
+def build_snpEff(reference_file, reference_gbk, bakta_path, baktadb, snpeffpath, java_path, threads, memory):
     gbk_out = Path("customref.gbk")
     if not gbk_out.exists():
-        bakta_gbk = find_first_existing_path("customref_bakta/customref.gbk", "customref_bakta/customref.gbff")
-        if bakta_gbk is None:
-            print("Annotating reference genome with Bakta...")
-            run_command(f"{bakta_path} --db {baktadb} --output customref_bakta --prefix customref --threads {threads} {reference_file}")
+        existing_reference_gbk = find_reference_gbk(reference_file, reference_gbk)
+        if existing_reference_gbk is not None:
+            print(f"Using existing reference GenBank annotation: {existing_reference_gbk}")
+            shutil.copyfile(existing_reference_gbk, gbk_out)
+        else:
             bakta_gbk = find_first_existing_path("customref_bakta/customref.gbk", "customref_bakta/customref.gbff")
-        if bakta_gbk is None:
-            raise FileNotFoundError("Bakta annotation finished but no GenBank output was found in customref_bakta/")
-        shutil.copyfile(bakta_gbk, gbk_out)
+            if bakta_gbk is None:
+                if not baktadb:
+                    raise FileNotFoundError("No reference GenBank annotation found and no Bakta DB is available.")
+                print("Annotating reference genome with Bakta...")
+                run_command(f"{bakta_path} --db {baktadb} --output customref_bakta --prefix customref --threads {threads} {reference_file}")
+                bakta_gbk = find_first_existing_path("customref_bakta/customref.gbk", "customref_bakta/customref.gbff")
+            if bakta_gbk is None:
+                raise FileNotFoundError("Bakta annotation finished but no GenBank output was found in customref_bakta/")
+            shutil.copyfile(bakta_gbk, gbk_out)
     else:
         print("Reference GBK already exists, skipping Bakta annotation.")
 
@@ -216,10 +245,11 @@ if __name__ == "__main__":
     spades_path = find_executable("spades.py", args.spades)
     bakta_path = find_executable("bakta", args.bakta)
     java_path = find_java_executable()
-    baktadb = find_bakta_db(args.baktadb)
+    reference_gbk = find_reference_gbk(args.reference, args.reference_gbk)
+    baktadb = "" if reference_gbk is not None and args.skip_sample_bakta else find_bakta_db(args.baktadb)
 
     os.environ["PATH"] = f"{Path(java_path).parent}{os.pathsep}{os.environ['PATH']}"
-    build_snpEff(args.reference, bakta_path, baktadb, snpeffpath, java_path, threads, memory)
+    build_snpEff(args.reference, args.reference_gbk, bakta_path, baktadb, snpeffpath, java_path, threads, memory)
 
     run_command(f"bwa index {args.reference}")
     run_command(f"{samtoolsPATH} faidx {args.reference}")
@@ -254,13 +284,16 @@ if __name__ == "__main__":
             named_fasta = f"{sra_id}.assembly.fasta"
             shutil.copyfile(assembled_fasta, named_fasta)
 
-            run_command(f"{bakta_path} --db {baktadb} --output {sra_id}_bakta --prefix {sra_id} --threads {threads} {named_fasta}")
-            bakta_gbk = find_first_existing_path(f"{sra_id}_bakta/{sra_id}.gbk", f"{sra_id}_bakta/{sra_id}.gbff")
-            bakta_gff = find_first_existing_path(f"{sra_id}_bakta/{sra_id}.gff", f"{sra_id}_bakta/{sra_id}.gff3")
-            if bakta_gbk is not None:
-                shutil.move(bakta_gbk, f"{sra_id}.bakta.gbk")
-            if bakta_gff is not None:
-                shutil.move(bakta_gff, f"{sra_id}.bakta.gff")
+            if args.skip_sample_bakta:
+                print(f"Skipping per-sample Bakta annotation for {sra_id}.")
+            else:
+                run_command(f"{bakta_path} --db {baktadb} --output {sra_id}_bakta --prefix {sra_id} --threads {threads} {named_fasta}")
+                bakta_gbk = find_first_existing_path(f"{sra_id}_bakta/{sra_id}.gbk", f"{sra_id}_bakta/{sra_id}.gbff")
+                bakta_gff = find_first_existing_path(f"{sra_id}_bakta/{sra_id}.gff", f"{sra_id}_bakta/{sra_id}.gff3")
+                if bakta_gbk is not None:
+                    shutil.move(bakta_gbk, f"{sra_id}.bakta.gbk")
+                if bakta_gff is not None:
+                    shutil.move(bakta_gff, f"{sra_id}.bakta.gff")
 
             run_command(f'bwa mem -t {threads} -R "@RG\\tID:{sra_id}\\tPL:ILLUMINA\\tLB:lib1\\tSM:{sra_id}" {args.reference} {trimmed_r1_file} {trimmed_r2_file} > {sra_id}_aln.sam')
             run_command(f'{gatkPATH} SortSam -I {sra_id}_aln.sam -O {sra_id}_sorted.bam -SO coordinate')
@@ -287,7 +320,7 @@ if __name__ == "__main__":
                 elif Path(temp_file).is_dir():
                     shutil.rmtree(temp_file)
 
-            print(f"Completed {sra_id}: outputs = {annotated_vcf}, {sra_id}.bakta.gbk, {sra_id}.bakta.gff")
+            print(f"Completed {sra_id}: outputs = {annotated_vcf}")
         except Exception as e:
             print(f"Error processing {sra_id}: {e}")
             continue
