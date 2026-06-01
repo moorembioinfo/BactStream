@@ -28,7 +28,7 @@ def add_args(a):
     parser.add_argument("--cutadapt", "-C", default=False, help="Path to Cutadapt", required=False)
     parser.add_argument("--spades", default="spades.py", help="Path to SPAdes", required=False)
     parser.add_argument("--bakta", default="bakta", help="Path to bakta", required=False)
-    parser.add_argument("--baktadb", default="", help="Path to Bakta DB", required=True)
+    parser.add_argument("--baktadb", default="", help="Path to Bakta DB. Defaults to $BACTSTREAM_BAKTA_DB if set.", required=False)
     parser.add_argument("--threads", type=int, default=0, help="Threads per tool (auto if 0)")
     parser.add_argument("--memory", type=int, default=0, help="Memory (GB) per tool (auto if 0)")
     return parser.parse_args(a)
@@ -133,6 +133,31 @@ def find_snpeff_jar(custom_path):
     print("snpEff.jar path not provided and not found in PATH or CONDA_PREFIX/share")
     sys.exit(1)
 
+def find_bakta_db(custom_path):
+    candidates = []
+    if custom_path:
+        candidates.append(custom_path)
+    env_path = os.environ.get("BACTSTREAM_BAKTA_DB")
+    if env_path:
+        candidates.append(env_path)
+    conda_prefix = os.environ.get("CONDA_PREFIX")
+    if conda_prefix:
+        candidates.extend([
+            str(Path(conda_prefix) / "share" / "bakta" / "db-light"),
+            str(Path(conda_prefix) / "share" / "bakta" / "db"),
+        ])
+
+    for candidate in candidates:
+        path = Path(candidate).expanduser()
+        if path.exists():
+            print(f"Bakta DB using: {path}")
+            return str(path)
+
+    print("Bakta DB path not provided and no usable default was found.")
+    print("Set BACTSTREAM_BAKTA_DB or pass --baktadb. You can install an env-local DB with:")
+    print("  bash install_bakta_db.sh")
+    sys.exit(1)
+
 def get_completed_ids(sra_ids):
     return [sra_id for sra_id in sra_ids if Path(f"{sra_id}.bakta.gbk").exists()]
 
@@ -191,7 +216,7 @@ if __name__ == "__main__":
     spades_path = find_executable("spades.py", args.spades)
     bakta_path = find_executable("bakta", args.bakta)
     java_path = find_java_executable()
-    baktadb = args.baktadb
+    baktadb = find_bakta_db(args.baktadb)
 
     os.environ["PATH"] = f"{Path(java_path).parent}{os.pathsep}{os.environ['PATH']}"
     build_snpEff(args.reference, bakta_path, baktadb, snpeffpath, java_path, threads, memory)
