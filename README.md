@@ -51,6 +51,19 @@ BactStream \
 
 The reference is still annotated with Bakta, unless `customref.gbk` already exists.
 
+When `--skip_assembly` is used, BactStream can process multiple accessions at the same time. If `--jobs` is not supplied, it uses the available CPU allocation and the per-genome `--threads` value to choose the number of concurrent genome streams. For example, on a 16 CPU job:
+
+```shell
+BactStream \
+  --reference <reference.fasta> \
+  --sra_ids <accessions.txt> \
+  --baktadb <bakta-db> \
+  --skip_assembly \
+  --threads 4
+```
+
+runs up to 4 genomes at once with 4 threads each. To force the stream count explicitly, add `--jobs <N>`.
+
 ## Consensus alignment output
 
 For each completed accession, BactStream writes:

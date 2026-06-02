@@ -7,15 +7,33 @@ from pathlib import Path
 import argparse
 import psutil
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-def get_resources(user_threads, user_memory):
-    total_cores = os.cpu_count() or 2
+def get_available_cores():
+    slurm_cpus = os.environ.get("SLURM_CPUS_PER_TASK")
+    if slurm_cpus and slurm_cpus.isdigit() and int(slurm_cpus) > 0:
+        return int(slurm_cpus)
+    return os.cpu_count() or 2
+
+def get_resources(args):
+    total_cores = get_available_cores()
     total_mem_gb = psutil.virtual_memory().available // (1024**3)
-    threads = user_threads if user_threads and user_threads > 0 else total_cores
-    memory = user_memory if user_memory and user_memory > 0 else total_mem_gb
+    jobs = args.jobs if args.jobs and args.jobs > 0 else 1
+    if args.threads and args.threads > 0:
+        threads = args.threads
+    elif args.skip_assembly and args.jobs and args.jobs > 0:
+        threads = max(1, total_cores // jobs)
+    elif args.skip_assembly:
+        threads = min(4, total_cores)
+    else:
+        threads = total_cores
+    if args.skip_assembly and not (args.jobs and args.jobs > 0):
+        jobs = max(1, total_cores // max(threads, 1))
+    memory = args.memory if args.memory and args.memory > 0 else total_mem_gb
+    memory_per_job = max(1, memory // jobs) if jobs > 1 else memory
     print(f"Detected resources: {total_cores} cores, {total_mem_gb}GB RAM")
-    print(f"Using: {threads} threads, {memory}GB memory per tool")
-    return threads, memory
+    print(f"Using: {jobs} concurrent genome(s), {threads} thread(s) per genome, {memory_per_job}GB memory per genome")
+    return threads, memory_per_job, jobs
 
 def add_args(a):
     parser = argparse.ArgumentParser(description="Bacterial pipeline: reference annotation, assembly, annotation, variant calling, snpEff")
@@ -33,7 +51,8 @@ def add_args(a):
     parser.add_argument("--skip_sample_bakta", action="store_true", help="Skip Bakta annotation of per-sample SPAdes assemblies", required=False)
     parser.add_argument("--skip_assembly", action="store_true", help="Skip per-sample SPAdes assembly and Bakta annotation; map reads directly to the reference", required=False)
     parser.add_argument("--threads", type=int, default=0, help="Threads per tool (auto if 0)")
-    parser.add_argument("--memory", type=int, default=0, help="Memory (GB) per tool (auto if 0)")
+    parser.add_argument("--memory", type=int, default=0, help="Memory budget in GB; split across concurrent genomes (auto if 0)")
+    parser.add_argument("--jobs", type=int, default=0, help="Concurrent genomes to process. Defaults to auto for --skip_assembly, otherwise 1.")
     return parser.parse_args(a)
 
 def run_command(command):
@@ -336,9 +355,85 @@ def build_snpEff(reference_file, reference_gbk, bakta_path, baktadb, snpeffpath,
     else:
         print("snpEff DB already exists, skipping build.")
 
+def process_sra_id(sra_id, args, tools, threads, memory):
+    gatkPATH = tools["gatk"]
+    trimgalore_path = tools["trimgalore"]
+    cutadapt_path = tools["cutadapt"]
+    spades_path = tools["spades"]
+    bakta_path = tools["bakta"]
+    baktadb = tools["baktadb"]
+    snpeffpath = tools["snpeff"]
+    java_path = tools["java"]
+
+    print(f"Processing {sra_id}...")
+    r1_file = f"{sra_id}_1.fastq"
+    r2_file = f"{sra_id}_2.fastq"
+    trimmed_r1_file = f"{sra_id}_1_val_1.fq.gz"
+    trimmed_r2_file = f"{sra_id}_2_val_2.fq.gz"
+    spades_outdir = None
+    named_fasta = None
+
+    try:
+        run_command(f"fasterq-dump --split-files {sra_id}")
+
+        run_command(f"{trimgalore_path} --path_to_cutadapt {cutadapt_path} --paired --cores {threads} --gzip {r1_file} {r2_file}")
+
+        if args.skip_assembly:
+            print(f"Skipping SPAdes assembly and per-sample Bakta annotation for {sra_id}.")
+        else:
+            spades_outdir = f"{sra_id}_spades_out"
+            run_command(f"{spades_path} -1 {trimmed_r1_file} -2 {trimmed_r2_file} -o {spades_outdir} --threads {threads} --memory {memory}")
+            assembled_fasta = f"{spades_outdir}/contigs.fasta"
+            if not Path(assembled_fasta).exists():
+                raise Exception(f"SPAdes failed: contigs.fasta not found for {sra_id}")
+            named_fasta = f"{sra_id}.assembly.fasta"
+            shutil.copyfile(assembled_fasta, named_fasta)
+
+        if args.skip_sample_bakta or args.skip_assembly:
+            print(f"Skipping per-sample Bakta annotation for {sra_id}.")
+        else:
+            run_command(f"{bakta_path} --db {baktadb} --output {sra_id}_bakta --prefix {sra_id} --threads {threads} {named_fasta}")
+            bakta_gbk = find_first_existing_path(f"{sra_id}_bakta/{sra_id}.gbk", f"{sra_id}_bakta/{sra_id}.gbff")
+            bakta_gff = find_first_existing_path(f"{sra_id}_bakta/{sra_id}.gff", f"{sra_id}_bakta/{sra_id}.gff3")
+            if bakta_gbk is not None:
+                shutil.move(bakta_gbk, f"{sra_id}.bakta.gbk")
+            if bakta_gff is not None:
+                shutil.move(bakta_gff, f"{sra_id}.bakta.gff")
+
+        run_command(f'bwa mem -t {threads} -R "@RG\\tID:{sra_id}\\tPL:ILLUMINA\\tLB:lib1\\tSM:{sra_id}" {args.reference} {trimmed_r1_file} {trimmed_r2_file} > {sra_id}_aln.sam')
+        run_command(f'{gatkPATH} SortSam -I {sra_id}_aln.sam -O {sra_id}_sorted.bam -SO coordinate')
+        run_command(f'{gatkPATH} MarkDuplicates -I {sra_id}_sorted.bam -O {sra_id}_dedup.bam -M {sra_id}_metrics.txt')
+        run_command(f'{gatkPATH} BuildBamIndex -I {sra_id}_dedup.bam')
+        run_command(f'{gatkPATH} HaplotypeCaller -R {args.reference} -I {sra_id}_dedup.bam --native-pair-hmm-threads {threads} -ploidy 1 -O {sra_id}_raw_gVCF.vcf -ERC GVCF')
+        run_command(f'{gatkPATH} GenotypeGVCFs -R {args.reference} --variant {sra_id}_raw_gVCF.vcf -O {sra_id}_raw.vcf')
+        filtered_vcf = f"{sra_id}.filtered.vcf"
+        run_command(f'{gatkPATH} VariantFiltration -R {args.reference} -V {sra_id}_raw.vcf -O {filtered_vcf} --filter-expression "QUAL < 30.0" --filter-name "LowQual"')
+
+        annotated_vcf = f"{filtered_vcf.replace('.vcf', '.snpeff.vcf')}"
+        snpeff_jar = Path(snpeffpath)
+        snpeff_dir = snpeff_jar.parent if snpeff_jar.name == "snpEff.jar" else snpeff_jar
+        run_command(f'{java_path} -Xmx{memory}G -jar {snpeff_jar} -c {snpeff_dir / "snpEff.config"} custom-db {filtered_vcf} > {annotated_vcf}')
+        consensus_fasta = f"{sra_id}.consensus.aln.fasta"
+        make_reference_aligned_consensus(args.reference, filtered_vcf, consensus_fasta, record_name=sra_id)
+        print(f"Completed {sra_id}: outputs = {annotated_vcf}, {consensus_fasta}")
+        return True
+    finally:
+        for temp_file in [
+            r1_file, r2_file, trimmed_r1_file, trimmed_r2_file,
+            f"{sra_id}_aln.sam", f"{sra_id}_sorted.bam", f"{sra_id}_metrics.txt",
+            f"{sra_id}_dedup.bam", f"{sra_id}_dedup.bai", f"{sra_id}_raw_gVCF.vcf", f"{sra_id}_raw.vcf",
+            named_fasta, spades_outdir, f"{sra_id}_bakta"
+        ]:
+            if temp_file is None:
+                continue
+            if Path(temp_file).is_file():
+                os.remove(temp_file)
+            elif Path(temp_file).is_dir():
+                shutil.rmtree(temp_file)
+
 if __name__ == "__main__":
     args = add_args(sys.argv[1:])
-    threads, memory = get_resources(args.threads, args.memory)
+    threads, memory, jobs = get_resources(args)
 
     snpeffpath = find_snpeff_jar(args.snpeff)
     gatkPATH = find_executable("gatk", args.gatk)
@@ -365,73 +460,35 @@ if __name__ == "__main__":
         sys.exit(0)
 
     print(f"Resuming from SRA ID: {remaining_ids[0]}")
-    for sra_id in remaining_ids:
-        try:
-            print(f"Processing {sra_id}...")
-            run_command(f"fasterq-dump --split-files {sra_id}")
-            r1_file = f"{sra_id}_1.fastq"
-            r2_file = f"{sra_id}_2.fastq"
-
-            run_command(f"{trimgalore_path} --path_to_cutadapt {cutadapt_path} --paired --cores {threads} --gzip {r1_file} {r2_file}")
-            trimmed_r1_file = f"{sra_id}_1_val_1.fq.gz"
-            trimmed_r2_file = f"{sra_id}_2_val_2.fq.gz"
-
-            spades_outdir = None
-            named_fasta = None
-            if args.skip_assembly:
-                print(f"Skipping SPAdes assembly and per-sample Bakta annotation for {sra_id}.")
-            else:
-                spades_outdir = f"{sra_id}_spades_out"
-                run_command(f"{spades_path} -1 {trimmed_r1_file} -2 {trimmed_r2_file} -o {spades_outdir} --threads {threads} --memory {memory}")
-                assembled_fasta = f"{spades_outdir}/contigs.fasta"
-                if not Path(assembled_fasta).exists():
-                    raise Exception(f"SPAdes failed: contigs.fasta not found for {sra_id}")
-                named_fasta = f"{sra_id}.assembly.fasta"
-                shutil.copyfile(assembled_fasta, named_fasta)
-
-            if args.skip_sample_bakta or args.skip_assembly:
-                print(f"Skipping per-sample Bakta annotation for {sra_id}.")
-            else:
-                run_command(f"{bakta_path} --db {baktadb} --output {sra_id}_bakta --prefix {sra_id} --threads {threads} {named_fasta}")
-                bakta_gbk = find_first_existing_path(f"{sra_id}_bakta/{sra_id}.gbk", f"{sra_id}_bakta/{sra_id}.gbff")
-                bakta_gff = find_first_existing_path(f"{sra_id}_bakta/{sra_id}.gff", f"{sra_id}_bakta/{sra_id}.gff3")
-                if bakta_gbk is not None:
-                    shutil.move(bakta_gbk, f"{sra_id}.bakta.gbk")
-                if bakta_gff is not None:
-                    shutil.move(bakta_gff, f"{sra_id}.bakta.gff")
-
-            run_command(f'bwa mem -t {threads} -R "@RG\\tID:{sra_id}\\tPL:ILLUMINA\\tLB:lib1\\tSM:{sra_id}" {args.reference} {trimmed_r1_file} {trimmed_r2_file} > {sra_id}_aln.sam')
-            run_command(f'{gatkPATH} SortSam -I {sra_id}_aln.sam -O {sra_id}_sorted.bam -SO coordinate')
-            run_command(f'{gatkPATH} MarkDuplicates -I {sra_id}_sorted.bam -O {sra_id}_dedup.bam -M {sra_id}_metrics.txt')
-            run_command(f'{gatkPATH} BuildBamIndex -I {sra_id}_dedup.bam')
-            run_command(f'{gatkPATH} HaplotypeCaller -R {args.reference} -I {sra_id}_dedup.bam --native-pair-hmm-threads {threads} -ploidy 1 -O {sra_id}_raw_gVCF.vcf -ERC GVCF')
-            run_command(f'{gatkPATH} GenotypeGVCFs -R {args.reference} --variant {sra_id}_raw_gVCF.vcf -O {sra_id}_raw.vcf')
-            filtered_vcf = f"{sra_id}.filtered.vcf"
-            run_command(f'{gatkPATH} VariantFiltration -R {args.reference} -V {sra_id}_raw.vcf -O {filtered_vcf} --filter-expression "QUAL < 30.0" --filter-name "LowQual"')
-
-            annotated_vcf = f"{filtered_vcf.replace('.vcf', '.snpeff.vcf')}"
-            snpeff_jar = Path(snpeffpath)
-            snpeff_dir = snpeff_jar.parent if snpeff_jar.name == "snpEff.jar" else snpeff_jar
-            run_command(f'{java_path} -Xmx{memory}G -jar {snpeff_jar} -c {snpeff_dir / "snpEff.config"} custom-db {filtered_vcf} > {annotated_vcf}')
-            consensus_fasta = f"{sra_id}.consensus.aln.fasta"
-            make_reference_aligned_consensus(args.reference, filtered_vcf, consensus_fasta, record_name=sra_id)
-
-            for temp_file in [
-                r1_file, r2_file, trimmed_r1_file, trimmed_r2_file,
-                f"{sra_id}_aln.sam", f"{sra_id}_sorted.bam", f"{sra_id}_metrics.txt",
-                f"{sra_id}_dedup.bam", f"{sra_id}_dedup.bai", f"{sra_id}_raw_gVCF.vcf", f"{sra_id}_raw.vcf",
-                named_fasta, spades_outdir, f"{sra_id}_bakta"
-            ]:
-                if temp_file is None:
-                    continue
-                if Path(temp_file).is_file():
-                    os.remove(temp_file)
-                elif Path(temp_file).is_dir():
-                    shutil.rmtree(temp_file)
-
-            print(f"Completed {sra_id}: outputs = {annotated_vcf}, {consensus_fasta}")
-        except Exception as e:
-            print(f"Error processing {sra_id}: {e}")
-            continue
+    tools = {
+        "gatk": gatkPATH,
+        "trimgalore": trimgalore_path,
+        "cutadapt": cutadapt_path,
+        "spades": spades_path,
+        "bakta": bakta_path,
+        "baktadb": baktadb,
+        "snpeff": snpeffpath,
+        "java": java_path,
+    }
+    if jobs == 1:
+        for sra_id in remaining_ids:
+            try:
+                process_sra_id(sra_id, args, tools, threads, memory)
+            except Exception as e:
+                print(f"Error processing {sra_id}: {e}")
+                continue
+    else:
+        print(f"Processing {len(remaining_ids)} genome(s) with {jobs} concurrent stream(s).")
+        with ThreadPoolExecutor(max_workers=jobs) as executor:
+            futures = {
+                executor.submit(process_sra_id, sra_id, args, tools, threads, memory): sra_id
+                for sra_id in remaining_ids
+            }
+            for future in as_completed(futures):
+                sra_id = futures[future]
+                try:
+                    future.result()
+                except Exception as e:
+                    print(f"Error processing {sra_id}: {e}")
 
     print("\n\nAll tasks completed!\n\n")
