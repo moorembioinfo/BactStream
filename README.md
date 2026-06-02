@@ -51,6 +51,19 @@ BactStream \
 
 The reference is still annotated with Bakta, unless `customref.gbk` already exists.
 
+## Consensus alignment output
+
+For each completed accession, BactStream writes:
+
+```text
+<accession>.filtered.snpeff.vcf
+<accession>.consensus.aln.fasta
+```
+
+The consensus FASTA is reference-coordinate aligned. PASS SNPs and MNVs replace the reference bases, and query deletions are represented as `-` gap characters. Insertions relative to the reference are ignored in this FASTA so every sample remains the same length as the reference and can be concatenated or combined into a pseudoalignment.
+
+For a single-contig reference, the FASTA record name is the accession. For multi-contig references, records are named `<accession>|<contig>`.
+
 ## Options
 If any of your dependencies are not in the path they can be provided:
 
@@ -118,5 +131,3 @@ Poplin R, Ruano-Rubio V, DePristo MA, Fennell TJ, Carneiro MO, Van der Auwera GA
 Van der Auwera GA & O'Connor BD. (2020). Genomics in the Cloud: Using Docker, GATK, and WDL in Terra (1st Edition). O'Reilly Media.  
 PROKKA:    
 Seemann T. Prokka: rapid prokaryotic genome annotation, Bioinformatics 2014 Jul 15;30(14):2068-9. PMID:24642063
-
-

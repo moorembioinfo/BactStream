@@ -40,6 +40,69 @@ def run_command(command):
     print(f"Running: {command}")
     subprocess.run(command, shell=True, check=True)
 
+def read_reference_sequences(reference_file):
+    sequences = {}
+    current_name = None
+    current_chunks = []
+    with open(reference_file, "r") as fasta:
+        for line in fasta:
+            line = line.rstrip("\n")
+            if line.startswith(">"):
+                if current_name is not None:
+                    sequences[current_name] = list("".join(current_chunks).upper())
+                current_name = line[1:].strip().split()[0]
+                current_chunks = []
+            else:
+                current_chunks.append(line.strip())
+    if current_name is not None:
+        sequences[current_name] = list("".join(current_chunks).upper())
+    return sequences
+
+def write_fasta(sequences, output_file, line_width=80, record_name=None):
+    with open(output_file, "w") as fasta:
+        for name, bases in sequences.items():
+            fasta_name = record_name if record_name and len(sequences) == 1 else name
+            if record_name and len(sequences) > 1:
+                fasta_name = f"{record_name}|{name}"
+            fasta.write(f">{fasta_name}\n")
+            seq = "".join(bases)
+            for i in range(0, len(seq), line_width):
+                fasta.write(seq[i:i + line_width] + "\n")
+
+def make_reference_aligned_consensus(reference_file, vcf_file, output_file, record_name=None):
+    sequences = read_reference_sequences(reference_file)
+    with open(vcf_file, "r") as vcf:
+        for line in vcf:
+            if line.startswith("#"):
+                continue
+            fields = line.rstrip("\n").split("\t")
+            if len(fields) < 8:
+                continue
+            chrom, pos_text, _id, ref, alt_text, _qual, filt = fields[:7]
+            if filt not in ("PASS", "."):
+                continue
+            if chrom not in sequences:
+                continue
+            alts = [alt for alt in alt_text.split(",") if alt and alt != "."]
+            if not alts:
+                continue
+            alt = alts[0].upper()
+            ref = ref.upper()
+            pos = int(pos_text) - 1
+
+            # Keep output in reference coordinates: SNPs/MNVs replace bases,
+            # deleted reference bases become gaps, inserted alt-only sequence is ignored.
+            shared_len = min(len(ref), len(alt))
+            for offset in range(shared_len):
+                if pos + offset < len(sequences[chrom]):
+                    sequences[chrom][pos + offset] = alt[offset]
+            if len(ref) > len(alt):
+                for offset in range(len(alt), len(ref)):
+                    if pos + offset < len(sequences[chrom]):
+                        sequences[chrom][pos + offset] = "-"
+
+    write_fasta(sequences, output_file, record_name=record_name)
+
 def parse_java_major_version(version_output):
     match = re.search(r'version "([^"]+)"', version_output)
     if not match:
@@ -350,6 +413,8 @@ if __name__ == "__main__":
             snpeff_jar = Path(snpeffpath)
             snpeff_dir = snpeff_jar.parent if snpeff_jar.name == "snpEff.jar" else snpeff_jar
             run_command(f'{java_path} -Xmx{memory}G -jar {snpeff_jar} -c {snpeff_dir / "snpEff.config"} custom-db {filtered_vcf} > {annotated_vcf}')
+            consensus_fasta = f"{sra_id}.consensus.aln.fasta"
+            make_reference_aligned_consensus(args.reference, filtered_vcf, consensus_fasta, record_name=sra_id)
 
             for temp_file in [
                 r1_file, r2_file, trimmed_r1_file, trimmed_r2_file,
@@ -364,7 +429,7 @@ if __name__ == "__main__":
                 elif Path(temp_file).is_dir():
                     shutil.rmtree(temp_file)
 
-            print(f"Completed {sra_id}: outputs = {annotated_vcf}")
+            print(f"Completed {sra_id}: outputs = {annotated_vcf}, {consensus_fasta}")
         except Exception as e:
             print(f"Error processing {sra_id}: {e}")
             continue
