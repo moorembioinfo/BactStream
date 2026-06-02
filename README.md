@@ -14,6 +14,43 @@ BactStream --reference <reference.fasta> --sra_ids <accessions.txt>
 
 If the run is interrupted just run _BactStream_ again and it'll continue where it left off
 
+## Reference contig names
+
+BactStream builds the custom snpEff database from the reference annotation. To avoid snpEff `ERROR_CHROMOSOME_NOT_FOUND` errors, the reference annotation is built with contig IDs derived from the reference FASTA header up to the first whitespace character. For example:
+
+```text
+>NC_000913.3 Escherichia coli str. K-12 substr. MG1655, complete genome
+```
+
+is treated as:
+
+```text
+NC_000913.3
+```
+
+This matches the chromosome names produced by BWA/GATK for the same reference.
+
+If you change the reference or need to rebuild the custom snpEff database, remove the existing generated reference annotation and custom snpEff database first:
+
+```shell
+rm -rf customref.gbk customref.reference.fna customref_bakta
+rm -rf <snpeff-directory>/data/custom-db
+```
+
+## Read mapping without query assembly
+
+For workflows that only need read mapping, variant calling, and snpEff annotation, skip per-sample SPAdes assembly and per-sample Bakta annotation:
+
+```shell
+BactStream \
+  --reference <reference.fasta> \
+  --sra_ids <accessions.txt> \
+  --baktadb <bakta-db> \
+  --skip_assembly
+```
+
+The reference is still annotated with Bakta, unless `customref.gbk` already exists.
+
 ## Options
 If any of your dependencies are not in the path they can be provided:
 
@@ -81,6 +118,5 @@ Poplin R, Ruano-Rubio V, DePristo MA, Fennell TJ, Carneiro MO, Van der Auwera GA
 Van der Auwera GA & O'Connor BD. (2020). Genomics in the Cloud: Using Docker, GATK, and WDL in Terra (1st Edition). O'Reilly Media.  
 PROKKA:    
 Seemann T. Prokka: rapid prokaryotic genome annotation, Bioinformatics 2014 Jul 15;30(14):2068-9. PMID:24642063
-
 
 

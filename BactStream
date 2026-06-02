@@ -31,6 +31,7 @@ def add_args(a):
     parser.add_argument("--baktadb", default="", help="Path to Bakta DB. Defaults to $BACTSTREAM_BAKTA_DB if set.", required=False)
     parser.add_argument("--reference_gbk", default="", help="Existing reference GenBank/GBFF annotation for snpEff DB build", required=False)
     parser.add_argument("--skip_sample_bakta", action="store_true", help="Skip Bakta annotation of per-sample SPAdes assemblies", required=False)
+    parser.add_argument("--skip_assembly", action="store_true", help="Skip per-sample SPAdes assembly and Bakta annotation; map reads directly to the reference", required=False)
     parser.add_argument("--threads", type=int, default=0, help="Threads per tool (auto if 0)")
     parser.add_argument("--memory", type=int, default=0, help="Memory (GB) per tool (auto if 0)")
     return parser.parse_args(a)
@@ -161,7 +162,7 @@ def find_bakta_db(custom_path):
     sys.exit(1)
 
 def get_completed_ids(sra_ids):
-    return [sra_id for sra_id in sra_ids if Path(f"{sra_id}.bakta.gbk").exists()]
+    return [sra_id for sra_id in sra_ids if Path(f"{sra_id}.filtered.snpeff.vcf").exists()]
 
 def find_first_existing_path(*paths):
     for path in paths:
@@ -169,6 +170,21 @@ def find_first_existing_path(*paths):
         if candidate.exists():
             return candidate
     return None
+
+def write_first_token_reference_fasta(reference_file):
+    normalized_reference = Path("customref.reference.fna")
+    source = Path(reference_file)
+    if normalized_reference.exists() and normalized_reference.stat().st_mtime >= source.stat().st_mtime:
+        return normalized_reference
+
+    with open(source, "r") as src, open(normalized_reference, "w") as dst:
+        for line in src:
+            if line.startswith(">"):
+                token = line[1:].strip().split()[0]
+                dst.write(f">{token}\n")
+            else:
+                dst.write(line)
+    return normalized_reference
 
 def reference_dict_path(reference_file):
     reference_path = Path(reference_file)
@@ -225,8 +241,9 @@ def build_snpEff(reference_file, reference_gbk, bakta_path, baktadb, snpeffpath,
             if bakta_gbk is None:
                 if not baktadb:
                     raise FileNotFoundError("No reference GenBank annotation found and no Bakta DB is available.")
-                print("Annotating reference genome with Bakta...")
-                run_command(f"{bakta_path} --db {baktadb} --output customref_bakta --prefix customref --threads {threads} --keep-contig-headers {reference_file}")
+                bakta_reference = write_first_token_reference_fasta(reference_file)
+                print(f"Annotating reference genome with Bakta using first-token contig IDs: {bakta_reference}")
+                run_command(f"{bakta_path} --db {baktadb} --output customref_bakta --prefix customref --threads {threads} --keep-contig-headers {bakta_reference}")
                 bakta_gbk = find_first_existing_path("customref_bakta/customref.gbk", "customref_bakta/customref.gbff")
             if bakta_gbk is None:
                 raise FileNotFoundError("Bakta annotation finished but no GenBank output was found in customref_bakta/")
@@ -265,7 +282,7 @@ if __name__ == "__main__":
     samtoolsPATH = find_executable("samtools", args.samtools)
     trimgalore_path = find_executable("trim_galore", args.trimgalore)
     cutadapt_path = find_executable("cutadapt", args.cutadapt)
-    spades_path = find_executable("spades.py", args.spades)
+    spades_path = None if args.skip_assembly else find_executable("spades.py", args.spades)
     bakta_path = find_executable("bakta", args.bakta)
     java_path = find_java_executable()
     reference_gbk = find_reference_gbk(args.reference, args.reference_gbk)
@@ -296,15 +313,20 @@ if __name__ == "__main__":
             trimmed_r1_file = f"{sra_id}_1_val_1.fq.gz"
             trimmed_r2_file = f"{sra_id}_2_val_2.fq.gz"
 
-            spades_outdir = f"{sra_id}_spades_out"
-            run_command(f"{spades_path} -1 {trimmed_r1_file} -2 {trimmed_r2_file} -o {spades_outdir} --threads {threads} --memory {memory}")
-            assembled_fasta = f"{spades_outdir}/contigs.fasta"
-            if not Path(assembled_fasta).exists():
-                raise Exception(f"SPAdes failed: contigs.fasta not found for {sra_id}")
-            named_fasta = f"{sra_id}.assembly.fasta"
-            shutil.copyfile(assembled_fasta, named_fasta)
+            spades_outdir = None
+            named_fasta = None
+            if args.skip_assembly:
+                print(f"Skipping SPAdes assembly and per-sample Bakta annotation for {sra_id}.")
+            else:
+                spades_outdir = f"{sra_id}_spades_out"
+                run_command(f"{spades_path} -1 {trimmed_r1_file} -2 {trimmed_r2_file} -o {spades_outdir} --threads {threads} --memory {memory}")
+                assembled_fasta = f"{spades_outdir}/contigs.fasta"
+                if not Path(assembled_fasta).exists():
+                    raise Exception(f"SPAdes failed: contigs.fasta not found for {sra_id}")
+                named_fasta = f"{sra_id}.assembly.fasta"
+                shutil.copyfile(assembled_fasta, named_fasta)
 
-            if args.skip_sample_bakta:
+            if args.skip_sample_bakta or args.skip_assembly:
                 print(f"Skipping per-sample Bakta annotation for {sra_id}.")
             else:
                 run_command(f"{bakta_path} --db {baktadb} --output {sra_id}_bakta --prefix {sra_id} --threads {threads} {named_fasta}")
@@ -335,6 +357,8 @@ if __name__ == "__main__":
                 f"{sra_id}_dedup.bam", f"{sra_id}_dedup.bai", f"{sra_id}_raw_gVCF.vcf", f"{sra_id}_raw.vcf",
                 named_fasta, spades_outdir, f"{sra_id}_bakta"
             ]:
+                if temp_file is None:
+                    continue
                 if Path(temp_file).is_file():
                     os.remove(temp_file)
                 elif Path(temp_file).is_dir():
