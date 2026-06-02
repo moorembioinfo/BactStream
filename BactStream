@@ -226,7 +226,7 @@ def build_snpEff(reference_file, reference_gbk, bakta_path, baktadb, snpeffpath,
                 if not baktadb:
                     raise FileNotFoundError("No reference GenBank annotation found and no Bakta DB is available.")
                 print("Annotating reference genome with Bakta...")
-                run_command(f"{bakta_path} --db {baktadb} --output customref_bakta --prefix customref --threads {threads} {reference_file}")
+                run_command(f"{bakta_path} --db {baktadb} --output customref_bakta --prefix customref --threads {threads} --keep-contig-headers {reference_file}")
                 bakta_gbk = find_first_existing_path("customref_bakta/customref.gbk", "customref_bakta/customref.gbff")
             if bakta_gbk is None:
                 raise FileNotFoundError("Bakta annotation finished but no GenBank output was found in customref_bakta/")
