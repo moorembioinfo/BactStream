@@ -170,6 +170,29 @@ def find_first_existing_path(*paths):
             return candidate
     return None
 
+def reference_dict_path(reference_file):
+    reference_path = Path(reference_file)
+    return reference_path.with_suffix(".dict")
+
+def prepare_reference_indexes(reference_file, gatk_path, samtools_path):
+    bwa_suffixes = [".amb", ".ann", ".bwt", ".pac", ".sa"]
+    if all(Path(f"{reference_file}{suffix}").exists() for suffix in bwa_suffixes):
+        print("BWA index already exists, skipping bwa index.")
+    else:
+        run_command(f"bwa index {reference_file}")
+
+    fai_path = Path(f"{reference_file}.fai")
+    if fai_path.exists():
+        print("samtools FASTA index already exists, skipping faidx.")
+    else:
+        run_command(f"{samtools_path} faidx {reference_file}")
+
+    dict_path = reference_dict_path(reference_file)
+    if dict_path.exists():
+        print(f"GATK sequence dictionary already exists, skipping CreateSequenceDictionary: {dict_path}")
+    else:
+        run_command(f"{gatk_path} CreateSequenceDictionary -R {reference_file} -O {dict_path}")
+
 def find_reference_gbk(reference_file, custom_path):
     candidates = []
     if custom_path:
@@ -251,10 +274,7 @@ if __name__ == "__main__":
     os.environ["PATH"] = f"{Path(java_path).parent}{os.pathsep}{os.environ['PATH']}"
     build_snpEff(args.reference, args.reference_gbk, bakta_path, baktadb, snpeffpath, java_path, threads, memory)
 
-    run_command(f"bwa index {args.reference}")
-    run_command(f"{samtoolsPATH} faidx {args.reference}")
-    reference_dict = args.reference.replace(args.reference.split('.')[-1], 'dict')
-    run_command(f"{gatkPATH} CreateSequenceDictionary -R {args.reference} -O {reference_dict}")
+    prepare_reference_indexes(args.reference, gatkPATH, samtoolsPATH)
 
     with open(args.sra_ids, "r") as f:
         sra_ids = [line.strip() for line in f if line.strip()]
