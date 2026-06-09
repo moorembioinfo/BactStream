@@ -30,7 +30,10 @@ NC_000913.3
 
 This matches the chromosome names produced by BWA/GATK for the same reference.
 
-If you change the reference or need to rebuild the custom snpEff database, remove the existing generated reference annotation and custom snpEff database first:
+The custom snpEff database name is derived from the reference contig names and
+lengths, so different references do not reuse the same `custom-db` cache. If
+you are running an older BactStream checkout and see this error, remove the old
+generic cache first:
 
 ```shell
 rm -rf customref.gbk customref.reference.fna customref_bakta

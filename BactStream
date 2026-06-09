@@ -7,6 +7,7 @@ from pathlib import Path
 import argparse
 import psutil
 import re
+import hashlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 def get_available_cores():
@@ -244,7 +245,18 @@ def find_bakta_db(custom_path):
     sys.exit(1)
 
 def get_completed_ids(sra_ids):
-    return [sra_id for sra_id in sra_ids if Path(f"{sra_id}.filtered.snpeff.vcf").exists()]
+    completed = []
+    for sra_id in sra_ids:
+        annotated_vcf = Path(f"{sra_id}.filtered.snpeff.vcf")
+        consensus_fasta = Path(f"{sra_id}.consensus.aln.fasta")
+        if (
+            annotated_vcf.exists()
+            and annotated_vcf.stat().st_size > 0
+            and consensus_fasta.exists()
+            and consensus_fasta.stat().st_size > 0
+        ):
+            completed.append(sra_id)
+    return completed
 
 def find_first_existing_path(*paths):
     for path in paths:
@@ -253,8 +265,9 @@ def find_first_existing_path(*paths):
             return candidate
     return None
 
-def write_first_token_reference_fasta(reference_file):
-    normalized_reference = Path("customref.reference.fna")
+def write_first_token_reference_fasta(reference_file, db_name=None):
+    normalized_name = f"{db_name}.reference.fna" if db_name else "customref.reference.fna"
+    normalized_reference = Path(normalized_name)
     source = Path(reference_file)
     if normalized_reference.exists() and normalized_reference.stat().st_mtime >= source.stat().st_mtime:
         return normalized_reference
@@ -267,6 +280,32 @@ def write_first_token_reference_fasta(reference_file):
             else:
                 dst.write(line)
     return normalized_reference
+
+def reference_signature(reference_file):
+    digest = hashlib.sha256()
+    current_name = None
+    current_length = 0
+
+    def update_current():
+        if current_name is not None:
+            digest.update(current_name.encode())
+            digest.update(b"\t")
+            digest.update(str(current_length).encode())
+            digest.update(b"\n")
+
+    with open(reference_file, "r") as fasta:
+        for line in fasta:
+            if line.startswith(">"):
+                update_current()
+                current_name = line[1:].strip().split()[0]
+                current_length = 0
+            else:
+                current_length += len(line.strip())
+    update_current()
+    return digest.hexdigest()[:12]
+
+def snpeff_db_name(reference_file):
+    return f"custom-db-{reference_signature(reference_file)}"
 
 def reference_dict_path(reference_file):
     reference_path = Path(reference_file)
@@ -312,37 +351,45 @@ def find_reference_gbk(reference_file, custom_path):
     return None
 
 def build_snpEff(reference_file, reference_gbk, bakta_path, baktadb, snpeffpath, java_path, threads, memory):
-    gbk_out = Path("customref.gbk")
+    db_name = snpeff_db_name(reference_file)
+    gbk_out = Path(f"{db_name}.gbk")
     if not gbk_out.exists():
         existing_reference_gbk = find_reference_gbk(reference_file, reference_gbk)
         if existing_reference_gbk is not None:
             print(f"Using existing reference GenBank annotation: {existing_reference_gbk}")
             shutil.copyfile(existing_reference_gbk, gbk_out)
         else:
-            bakta_gbk = find_first_existing_path("customref_bakta/customref.gbk", "customref_bakta/customref.gbff")
+            bakta_outdir = Path(f"{db_name}_bakta")
+            bakta_gbk = find_first_existing_path(
+                bakta_outdir / "customref.gbk",
+                bakta_outdir / "customref.gbff",
+            )
             if bakta_gbk is None:
                 if not baktadb:
                     raise FileNotFoundError("No reference GenBank annotation found and no Bakta DB is available.")
-                bakta_reference = write_first_token_reference_fasta(reference_file)
+                bakta_reference = write_first_token_reference_fasta(reference_file, db_name=db_name)
                 print(f"Annotating reference genome with Bakta using first-token contig IDs: {bakta_reference}")
-                run_command(f"{bakta_path} --db {baktadb} --output customref_bakta --prefix customref --threads {threads} --keep-contig-headers {bakta_reference}")
-                bakta_gbk = find_first_existing_path("customref_bakta/customref.gbk", "customref_bakta/customref.gbff")
+                run_command(f"{bakta_path} --db {baktadb} --output {bakta_outdir} --prefix customref --threads {threads} --keep-contig-headers {bakta_reference}")
+                bakta_gbk = find_first_existing_path(
+                    bakta_outdir / "customref.gbk",
+                    bakta_outdir / "customref.gbff",
+                )
             if bakta_gbk is None:
-                raise FileNotFoundError("Bakta annotation finished but no GenBank output was found in customref_bakta/")
+                raise FileNotFoundError(f"Bakta annotation finished but no GenBank output was found in {bakta_outdir}/")
             shutil.copyfile(bakta_gbk, gbk_out)
     else:
         print("Reference GBK already exists, skipping Bakta annotation.")
 
     snpeff_jar = Path(snpeffpath)
     snpeff_dir = snpeff_jar.parent if snpeff_jar.name == "snpEff.jar" else snpeff_jar
-    snpeff_db_dir = snpeff_dir / "data" / "custom-db"
+    snpeff_db_dir = snpeff_dir / "data" / db_name
     genes_gbk = snpeff_db_dir / "genes.gbk"
     if not snpeff_db_dir.exists() or not genes_gbk.exists():
-        print("Building custom snpEff database using Bakta GBK...")
+        print(f"Building custom snpEff database {db_name} using Bakta GBK...")
         os.makedirs(snpeff_db_dir, exist_ok=True)
         shutil.copy(gbk_out, genes_gbk)
         config_path = snpeff_dir / "snpEff.config"
-        config_line = "custom-db.genome: custom-db\n"
+        config_line = f"{db_name}.genome: {db_name}\n"
         if config_path.exists():
             with open(config_path, "r") as cf:
                 if config_line not in cf.read():
@@ -351,9 +398,10 @@ def build_snpEff(reference_file, reference_gbk, bakta_path, baktadb, snpeffpath,
         else:
             with open(config_path, "w") as cfa:
                 cfa.write(config_line)
-        run_command(f"{java_path} -jar {snpeff_jar} build -genbank -c {config_path} -v custom-db")
+        run_command(f"{java_path} -jar {snpeff_jar} build -genbank -c {config_path} -v {db_name}")
     else:
-        print("snpEff DB already exists, skipping build.")
+        print(f"snpEff DB {db_name} already exists, skipping build.")
+    return db_name
 
 def process_sra_id(sra_id, args, tools, threads, memory):
     gatkPATH = tools["gatk"]
@@ -363,6 +411,7 @@ def process_sra_id(sra_id, args, tools, threads, memory):
     bakta_path = tools["bakta"]
     baktadb = tools["baktadb"]
     snpeffpath = tools["snpeff"]
+    snpeff_db = tools["snpeff_db"]
     java_path = tools["java"]
 
     print(f"Processing {sra_id}...")
@@ -412,7 +461,7 @@ def process_sra_id(sra_id, args, tools, threads, memory):
         annotated_vcf = f"{filtered_vcf.replace('.vcf', '.snpeff.vcf')}"
         snpeff_jar = Path(snpeffpath)
         snpeff_dir = snpeff_jar.parent if snpeff_jar.name == "snpEff.jar" else snpeff_jar
-        run_command(f'{java_path} -Xmx{memory}G -jar {snpeff_jar} -c {snpeff_dir / "snpEff.config"} custom-db {filtered_vcf} > {annotated_vcf}')
+        run_command(f'{java_path} -Xmx{memory}G -jar {snpeff_jar} -c {snpeff_dir / "snpEff.config"} {snpeff_db} {filtered_vcf} > {annotated_vcf}')
         consensus_fasta = f"{sra_id}.consensus.aln.fasta"
         make_reference_aligned_consensus(args.reference, filtered_vcf, consensus_fasta, record_name=sra_id)
         print(f"Completed {sra_id}: outputs = {annotated_vcf}, {consensus_fasta}")
@@ -447,7 +496,7 @@ if __name__ == "__main__":
     baktadb = "" if reference_gbk is not None and args.skip_sample_bakta else find_bakta_db(args.baktadb)
 
     os.environ["PATH"] = f"{Path(java_path).parent}{os.pathsep}{os.environ['PATH']}"
-    build_snpEff(args.reference, args.reference_gbk, bakta_path, baktadb, snpeffpath, java_path, threads, memory)
+    snpeff_db = build_snpEff(args.reference, args.reference_gbk, bakta_path, baktadb, snpeffpath, java_path, threads, memory)
 
     prepare_reference_indexes(args.reference, gatkPATH, samtoolsPATH)
 
@@ -468,6 +517,7 @@ if __name__ == "__main__":
         "bakta": bakta_path,
         "baktadb": baktadb,
         "snpeff": snpeffpath,
+        "snpeff_db": snpeff_db,
         "java": java_path,
     }
     if jobs == 1:
